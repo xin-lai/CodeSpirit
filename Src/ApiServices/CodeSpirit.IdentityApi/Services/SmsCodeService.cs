@@ -5,7 +5,8 @@ using CodeSpirit.Settings.Services.Interfaces;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System.Text;
+using System.Globalization;
+using System.Security.Cryptography;
 
 namespace CodeSpirit.IdentityApi.Services;
 
@@ -77,11 +78,13 @@ public class SmsCodeService : ISmsCodeService, IScopedDependency
             var lastSendTime = await _cache.GetStringAsync(rateLimitKey);
             if (!string.IsNullOrEmpty(lastSendTime))
             {
-                var lastSend = DateTime.Parse(lastSendTime);
+                // 使用 Round-trip 格式与 InvariantCulture，避免不同时区/区域设置导致解析偏差
+                var lastSend = DateTimeOffset.Parse(lastSendTime, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
                 var interval = TimeSpan.FromSeconds(settings.SendIntervalSeconds);
-                if (DateTime.UtcNow - lastSend < interval)
+                var elapsed = DateTimeOffset.UtcNow - lastSend;
+                if (elapsed < interval)
                 {
-                    var remainingSeconds = (int)(interval - (DateTime.UtcNow - lastSend)).TotalSeconds;
+                    var remainingSeconds = (int)(interval - elapsed).TotalSeconds;
                     _logger.LogWarning("发送验证码过于频繁，手机号: {PhoneNumber}, 还需等待 {RemainingSeconds} 秒", 
                         phoneNumber, remainingSeconds);
                     return false;
@@ -100,7 +103,7 @@ public class SmsCodeService : ISmsCodeService, IScopedDependency
             await _cache.SetStringAsync(cacheKey, code, cacheOptions);
 
             // 记录发送时间
-            await _cache.SetStringAsync(rateLimitKey, DateTime.UtcNow.ToString("O"), 
+            await _cache.SetStringAsync(rateLimitKey, DateTimeOffset.UtcNow.ToString("O"), 
                 new DistributedCacheEntryOptions
                 {
                     AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(settings.SendIntervalSeconds)
@@ -211,13 +214,22 @@ public class SmsCodeService : ISmsCodeService, IScopedDependency
     /// <returns>验证码</returns>
     private string GenerateCode(int length)
     {
-        var random = new Random();
-        var code = new StringBuilder(length);
+        if (length <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(length),
+                length,
+                "验证码长度必须大于 0（Code length must be greater than 0）。");
+        }
+
+        // 使用加密安全的随机数生成器，避免验证码可预测
+        char[] chars = new char[length];
         for (int i = 0; i < length; i++)
         {
-            code.Append(random.Next(0, 10));
+            chars[i] = (char)('0' + RandomNumberGenerator.GetInt32(10));
         }
-        return code.ToString();
+
+        return new string(chars);
     }
 
     /// <summary>
