@@ -117,27 +117,41 @@ public class QuestionAiGeneratorService : BaseAiGeneratorService<AIGenerateQuest
             await aiTaskService.UpdateTaskStatusAsync(taskId, AiTaskStatus.Running, 2, 30, "AI正在分析您的需求并生成内容...");
             await aiTaskService.AddTaskLogAsync(taskId, "开始AI内容生成");
 
-            // 创建同步的进度回调
-            var result = await DoGenerateAsyncWithScope(serviceProvider, request, (progress, message) => 
+            // 创建“非阻塞但有序”的进度回调：
+            // - 禁止使用 .Wait()/.Result（会造成线程池饥饿甚至死锁）
+            // - 通过任务链串行化更新，既不阻塞回调调用方，也尽量保持进度更新顺序
+            object progressUpdateSync = new();
+            Task progressUpdateChain = Task.CompletedTask;
+
+            void EnqueueProgressUpdate(double progress, string message)
             {
-                // 同步执行进度更新，不使用Task.Run
-                try
+                var actualProgress = 30 + (int)(progress * 50); // 30% + 50% for generation
+                _logger.LogInformation("排队更新进度: {Progress} -> {ActualProgress}%, {Message}", progress, actualProgress, message);
+
+                lock (progressUpdateSync)
                 {
-                    var actualProgress = 30 + (int)(progress * 50); // 30% + 50% for generation
-                    _logger.LogInformation("同步更新进度: {Progress} -> {ActualProgress}%, {Message}", progress, actualProgress, message);
-                    
-                    // 同步调用，确保进度更新立即执行
-                    aiTaskService.UpdateTaskStatusAsync(taskId, AiTaskStatus.Running, 2, actualProgress, message).Wait();
-                    if (!string.IsNullOrEmpty(message))
-                    {
-                        aiTaskService.AddTaskLogAsync(taskId, message).Wait();
-                    }
+                    progressUpdateChain = progressUpdateChain
+                        .ContinueWith(async _ =>
+                        {
+                            try
+                            {
+                                await aiTaskService.UpdateTaskStatusAsync(taskId, AiTaskStatus.Running, 2, actualProgress, message);
+                                if (!string.IsNullOrEmpty(message))
+                                {
+                                    await aiTaskService.AddTaskLogAsync(taskId, message);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "更新任务进度时出错：{TaskId}", taskId);
+                            }
+                        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default)
+                        .Unwrap();
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "更新任务进度时出错：{TaskId}", taskId);
-                }
-            });
+            }
+
+            var result = await DoGenerateAsyncWithScope(serviceProvider, request, EnqueueProgressUpdate);
+            await progressUpdateChain;
 
             // 步骤 3: 结果处理
             await aiTaskService.UpdateTaskStatusAsync(taskId, AiTaskStatus.Running, 3, 85, "正在处理生成结果...");
